@@ -15,6 +15,7 @@ const { Server } = require('socket.io');
 
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
+const { MM_CFG, findMatches } = require('./matchmaking');
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
@@ -68,6 +69,22 @@ const STICKER_CATALOG = [
 ];
 const STICKER_COOLDOWN_MS = 1200; // intervalo mínimo entre um envio e outro, por jogador
 
+const CHARACTER_CATALOG = [
+  { id:'hero', name:'Hero', tier:'standard' }
+  // { id:'volt', name:'Volt', tier:'premium' }  // adicione aqui quando processar o personagem novo
+];
+const DEFAULT_CHARACTER = 'hero';
+
+function findCharacter(id){
+  for(var i=0;i<CHARACTER_CATALOG.length;i++){ if(CHARACTER_CATALOG[i].id===id) return CHARACTER_CATALOG[i]; }
+  return null;
+}
+function playerOwnsCharacter(entity, id){
+  var c = findCharacter(id);
+  if(!c) return false;
+  return entity.ownedCharacters.indexOf(id) !== -1;
+}
+
 function findSticker(id){
   for(var i=0;i<STICKER_CATALOG.length;i++){ if(STICKER_CATALOG[i].id===id) return STICKER_CATALOG[i]; }
   return null;
@@ -75,13 +92,12 @@ function findSticker(id){
 function playerOwnsSticker(entity, id){
   var s = findSticker(id);
   if(!s) return false;
-  if(s.tier==='standard') return true;
   return entity.ownedStickers.indexOf(id) !== -1;
 }
 
 /* ==================== TEMA VISUAL (a paleta/textura em si é só do cliente;
    o servidor só decide QUAL tema vale pra rodada, pra todo mundo ver o mesmo) */
-const THEMES = ['classic', 'ice'];
+const THEMES = ['classic', 'ice', 'cave'];
 function pickTheme(){ return THEMES[Math.floor(Math.random()*THEMES.length)]; }
 
 /* ==================== MAPA ==================== */
@@ -140,8 +156,9 @@ function newEntity(id, x, y, color, isBot){
     shieldActive:false, shieldTimer:0,
     curse:null, curseTimer:0, curseSeq:null,
     alive:true, deathTimer:0, deathReason:'',
-    ownedStickers: [], lastStickerAt: 0,
-    userId: null, nickname: null, // preenchidos se estiver logado; null = convidado
+    ownedStickers: STICKER_CATALOG.filter(function(s){ return s.tier==='standard'; }).map(function(s){ return s.id; }), lastStickerAt: 0,
+    userId: null, nickname: null, characterId: DEFAULT_CHARACTER, // preenchidos se estiver logado; null = convidado
+    ownedCharacters: CHARACTER_CATALOG.filter(function(c){ return c.tier==='standard'; }).map(function(c){ return c.id; }),
     input: isBot ? null : {ix:0, iy:0},
     ai: isBot ? {decisionTimer:0, ix:0, iy:0} : null
   };
@@ -203,13 +220,46 @@ function stepEntityMovement(room, entity, ix, iy, speed, dt){
     var desiredSign = desired.x!==0 ? desired.x : desired.y;
     if(desiredAxis === entity.axis){
       entity.moveDir = desiredSign;
-    } else {
-      if(canMove(room, entity, desired)){
-        if(entity.axis==='x') entity.x = Math.floor(entity.x)+0.5;
-        else entity.y = Math.floor(entity.y)+0.5;
+    } else if(canMove(room, entity, desired)){
+      /* Virar de eixo exige alinhar a coordenada do eixo que está sendo
+         deixado ao centro da célula (é isso que vira a "pista" do novo eixo).
+         Antes, esse alinhamento era um teleporte instantâneo pro centro,
+         não importava o quão longe dele o jogador estivesse — daí o
+         "engasgo": ele parecia parar/recuar um instante antes de virar.
+         Agora só viramos quando o jogador está perto o bastante do centro
+         pra alcançá-lo neste próprio tick (ou já parado), senão a curva
+         fica pendente e é concedida assim que ele passar pelo centro do
+         corredor — sem precisar soltar e apertar a tecla de novo. */
+      var pos = entity.axis==='x' ? entity.x : entity.y;
+      var center = Math.floor(pos) + 0.5;
+      var fwd = entity.moveDir;
+      var tol = Math.max(speed*dt, 0.03);
+      var aheadDist = fwd===0 ? 0 : (center-pos)*fwd; // >0: centro ainda à frente
+
+      if(fwd===0 || Math.abs(aheadDist) <= tol){
+        // No centro (ou bem perto, ou parado): vira liso, sem pulo perceptível.
+        if(entity.axis==='x') entity.x = center; else entity.y = center;
         entity.axis = desiredAxis;
         entity.moveDir = desiredSign;
+      } else if(aheadDist < 0){
+        // Já passou do centro deste corredor. Só vale recuar até ele se não
+        // houver como seguir em frente (travado contra parede); do contrário
+        // deixa o jogador seguir até o próximo corredor e virar lá.
+        var fwdDelta = entity.axis==='x' ? {x:fwd,y:0} : {x:0,y:fwd};
+        var blockedAhead = !canMove(room, entity, fwdDelta);
+        if(blockedAhead){
+          // Já está parado/travado na parede: não há movimento em curso pra
+          // interromper, então deslizar de volta ao centro (na mesma
+          // velocidade) não gera soluço nem pulo visível.
+          var maxStep = speed*dt;
+          var newPos = fwd>0 ? Math.max(center, pos-maxStep) : Math.min(center, pos+maxStep);
+          if(entity.axis==='x') entity.x = newPos; else entity.y = newPos;
+          if(newPos===center){ entity.axis = desiredAxis; entity.moveDir = desiredSign; }
+          return; // posição já resolvida neste tick
+        }
       }
+      // caso contrário (ainda em trânsito, sem estar travado): mantém o eixo
+      // atual por enquanto, a virada será reavaliada no próximo tick.
     }
   }
 
@@ -264,15 +314,20 @@ function destroyPowerupAt(room, gx, gy){
   return found;
 }
 function killEntitiesInCells(room, cells, reason){
+  var justDied = [];
   for(var e=0; e<room.entities.length; e++){
     var ent = room.entities[e];
     if(!ent.alive) continue;
     if(reason==='blast' && ent.shieldActive) continue;
     var egx = Math.floor(ent.x), egy = Math.floor(ent.y);
     for(var k=0;k<cells.length;k++){
-      if(cells[k].x===egx && cells[k].y===egy){ killEntity(ent, reason); break; }
+      if(cells[k].x===egx && cells[k].y===egy){
+        if(killEntity(ent, reason)) justDied.push(ent.id);
+        break;
+      }
     }
   }
+  if(justDied.length) room.deathOrder.push(justDied);
 }
 function explodeBomb(room, bomb){
   if(bomb.exploded) return;
@@ -340,9 +395,13 @@ function hardenCellToWall(room, gx, gy){
   room.bombs.forEach(function(b){ if(!b.exploded && b.gx===gx && b.gy===gy) explodeBomb(room, b); });
   destroyPowerupAt(room, gx, gy);
   room.grid[gy][gx] = WALL;
+  var wallDeaths = [];
   room.entities.forEach(function(ent){
-    if(ent.alive && boxOverlapsCell(ent.x, ent.y, ent.r, gx, gy)) killEntity(ent, 'wall');
+    if(ent.alive && boxOverlapsCell(ent.x, ent.y, ent.r, gx, gy)){
+      if(killEntity(ent, 'wall')) wallDeaths.push(ent.id);
+    }
   });
+  if(wallDeaths.length) room.deathOrder.push(wallDeaths);
 }
 function vanishRing(room, r){
   for(var y=0;y<CFG.rows;y++){
@@ -457,10 +516,11 @@ function updateStatusEffects(room, dt){
   });
 }
 function killEntity(entity, reason){
-  if(!entity.alive) return;
+  if(!entity.alive) return false;
   entity.alive = false;
   entity.deathTimer = 0.9;
   entity.deathReason = reason;
+  return true;
 }
 
 /* ==================== IA DOS BOTS ==================== */
@@ -682,9 +742,11 @@ function createRoomObj(code, maxPlayers){
     entities: [],
     hostSocketId: null,
     state: 'lobby',       // lobby | playing | ended
+    locked: false,        // true = sala de matchmaking (não aceita entrada por código)
     grid: null,
     bombs: [], explosions: [], powerups: [],
     ringsVanished: new Set(),
+    deathOrder: [], // grupos de ids que morreram juntos, do mais antigo pro mais recente
     elapsed: 0,
     tickHandle: null,
     lastTickAt: null
@@ -708,42 +770,145 @@ async function getPlayerAccount(accessToken){
   if(!accessToken) return null; // sem token = convidado
 
   var authRes = await supabaseAdmin.auth.getUser(accessToken);
-  if(authRes.error || !authRes.data || !authRes.data.user) return null; // token inválido/expirado
+  if(authRes.error || !authRes.data || !authRes.data.user){
+    //console.log('[conta] token inválido:', authRes.error && authRes.error.message);
+    return null;
+  }
 
   var userId = authRes.data.user.id;
   var profileRes = await supabaseAdmin
     .from('profiles')
-    .select('nickname, owned_stickers, coins, wins, matches_played')
+    .select('nickname, owned_stickers, coins, wins, matches_played, skill_rating_2p, skill_rating_4p, owned_characters, selected_character')
     .eq('id', userId)
     .single();
-  if(profileRes.error || !profileRes.data) return null;
+  if(profileRes.error || !profileRes.data){
+    //console.log('[conta] perfil não encontrado para', userId, '-', profileRes.error && profileRes.error.message);
+    return null;
+  }
 
+  //console.log('[conta] logado com sucesso como:', profileRes.data.nickname);
   return {
     userId: userId,
     nickname: profileRes.data.nickname,
-    ownedStickers: profileRes.data.owned_stickers || []
+    skillRating: { 2: profileRes.data.skill_rating_2p, 4: profileRes.data.skill_rating_4p },
+    ownedStickers: profileRes.data.owned_stickers || [],
+    ownedCharacters: profileRes.data.owned_characters || ['hero'],
+    selectedCharacter: profileRes.data.selected_character || 'hero'    
   };
 }
 
-async function joinRoomSocket(room, socket, cb, accessToken){
+// Coloca o socket na sala (síncrono). Usado pela entrada por código e pelo
+// matchmaking. Devolve o payload que o cliente recebe ao entrar.
+function attachPlayer(room, socket, account){
   socket.join(room.code);
   socket.data.roomCode = room.code;
   var color = PLAYER_COLORS[room.sockets.size % PLAYER_COLORS.length];
   var entity = newEntity(socket.id, 1.5, 1.5, color, false);
 
-  var account = await getPlayerAccount(accessToken);
   if(account){
     entity.userId = account.userId;
     entity.nickname = account.nickname;
-    entity.ownedStickers = account.ownedStickers; // já prepara terreno pra Fase 3
+    entity.ownedStickers = account.ownedStickers;
+    entity.ownedCharacters = account.ownedCharacters;
+    if(playerOwnsCharacter(entity, account.selectedCharacter)){
+      entity.characterId = account.selectedCharacter;
+    }
   }
 
   room.sockets.set(socket.id, entity);
   room.entities.push(entity);
   if(!room.hostSocketId) room.hostSocketId = socket.id;
-  if(cb) cb({ ok:true, code: room.code, you: socket.id, isHost: room.hostSocketId===socket.id, maxPlayers: room.maxPlayers, stickers: STICKER_CATALOG, ownedStickers: entity.ownedStickers });
-  broadcastLobby(room);
+  return {
+    ok: true, code: room.code, you: socket.id,
+    isHost: room.hostSocketId === socket.id, maxPlayers: room.maxPlayers,
+    stickers: STICKER_CATALOG, ownedStickers: entity.ownedStickers,
+    characters: CHARACTER_CATALOG, ownedCharacters: entity.ownedCharacters,
+    characterId: entity.characterId
+  };
 }
+
+async function joinRoomSocket(room, socket, cb, accessToken){
+  try {
+    var account = await getPlayerAccount(accessToken);
+
+    // O jogador pode ter saído/desconectado enquanto consultávamos o Supabase
+    if(!socket.connected){ return; }
+    // A sala pode ter sido encerrada, iniciada ou lotada durante a espera
+    if(rooms.get(room.code) !== room || room.state !== 'lobby' || room.sockets.size >= room.maxPlayers){
+      if(cb) cb({ ok:false, error:'Sala indisponível.' });
+      return;
+    }
+
+    var payload = attachPlayer(room, socket, account);
+    if(cb) cb(payload);
+    broadcastLobby(room);
+  } catch(err){
+    console.error('[joinRoom] erro:', err);
+    if(cb) cb({ ok:false, error:'Não foi possível entrar na sala. Tente de novo.' });
+  }
+}
+
+/* ==================== MATCHMAKING ====================
+   Fila por modo (2 ou 4 jogadores). A cada MM_CFG.tickMs o servidor tenta
+   formar partidas com jogadores de Skill Rating parecido (a tolerância
+   aumenta com a espera; passado botFillAfterMs completa com bots).
+   A decisão de quem joga com quem está em matchmaking.js. */
+var mmQueues = { 2: [], 4: [] };
+var mmTokenSeq = 0;
+
+function removeFromQueue(socket){
+  socket.data.mmToken = null; // invalida qualquer findMatch ainda esperando o Supabase
+  [2, 4].forEach(function(size){
+    mmQueues[size] = mmQueues[size].filter(function(t){ return t.socket !== socket; });
+  });
+}
+
+// Mesma conta já na fila ou numa partida em andamento (outra aba/aparelho)?
+function isUserBusy(userId){
+  var busy = false;
+  [2, 4].forEach(function(size){
+    mmQueues[size].forEach(function(t){ if(t.userId === userId) busy = true; });
+  });
+  if(busy) return true;
+  rooms.forEach(function(room){
+    if(room.state === 'ended') return;
+    room.sockets.forEach(function(entity){ if(entity.userId === userId) busy = true; });
+  });
+  return busy;
+}
+
+function startMatchedRoom(size, tickets){
+  var code = makeRoomCode();
+  var room = createRoomObj(code, size);
+  room.locked = true;
+  rooms.set(code, room);
+
+  tickets.forEach(function(t){
+    t.socket.data.mmToken = null;
+    var payload = attachPlayer(room, t.socket, t.account);
+    t.socket.emit('matchFound', payload);
+  });
+  broadcastLobby(room);
+  console.log('[matchmaking] sala ' + code + ': ' + tickets.length + ' humano(s) + ' + (size - tickets.length) +
+    ' bot(s), SR ' + tickets.map(function(t){ return t.sr; }).join('/'));
+
+  // pequena pausa pra todos verem "partida encontrada" antes de começar
+  setTimeout(function(){
+    if(rooms.get(code) === room && room.state === 'lobby'){ beginRoom(room); }
+  }, MM_CFG.startDelayMs);
+}
+
+function runMatchmaking(){
+  var now = Date.now();
+  [2, 4].forEach(function(size){
+    // descarta quem desconectou sem avisar
+    mmQueues[size] = mmQueues[size].filter(function(t){ return t.socket.connected; });
+    var result = findMatches(mmQueues[size], size, now, MM_CFG);
+    mmQueues[size] = result.remaining;
+    result.matches.forEach(function(m){ startMatchedRoom(size, m.tickets); });
+  });
+}
+setInterval(runMatchmaking, MM_CFG.tickMs);
 
 function destroyRoom(room){
   if(room.tickHandle){ clearInterval(room.tickHandle); room.tickHandle = null; }
@@ -757,7 +922,7 @@ function handleLeave(room, socket){
   socket.leave(room.code);
 
   if(room.state === 'playing'){
-    if(entity && entity.alive) killEntity(entity, 'left');
+    if(entity && entity.alive){ if(killEntity(entity, 'left')) room.deathOrder.push([entity.id]); }
     if(room.sockets.size === 0){ destroyRoom(room); }
     return;
   }
@@ -823,14 +988,122 @@ function checkRoomEnd(room){
   return false;
 }
 
-function endRoom(room, winner, cause){
+var SR_TABLE = {
+  2: { placement: {1:15, 2:-15}, tie: {2:0} },
+  4: { placement: {1:30, 2:13, 3:-12, 4:-30}, tie: {2:15, 3:-10, 4:-35} }
+};
+var COINS_TABLE = {
+  2: { placement: {1:70, 2:0}, tie: {2:0} },
+  4: { placement: {1:70, 2:53, 3:0, 4:0}, tie: {2:53, 3:53, 4:53} }
+};
+
+// Transforma a ordem de mortes + quem sobrou vivo numa lista de colocações,
+// do 1º lugar pro último. Empates (mortes simultâneas, ou sobreviventes
+// quando o tempo acaba) formam um único grupo, todos com a mesma colocação.
+function computeStandings(room){
+  var groups = room.deathOrder.map(function(g){ return g.slice(); });
+  var survivors = room.entities.filter(function(e){ return e.alive; }).map(function(e){ return e.id; });
+  if(survivors.length) groups.push(survivors); // sobreviventes = o grupo do topo
+  var standings = [];
+  var rank = 1;
+  for(var i=groups.length-1; i>=0; i--){
+    standings.push({ ids: groups[i], rank: rank, size: groups[i].length });
+    rank += groups[i].length;
+  }
+  return standings;
+}
+
+// Aplica uma tabela de pontos (SR_TABLE ou COINS_TABLE) às colocações da sala.
+// Devolve { idDoJogador: valor }.
+function computeStandingValues(room, scoreTable){
+  var table = scoreTable[room.maxPlayers];
+  var values = {};
+  if(!table) return values;
+  computeStandings(room).forEach(function(group){
+    var value = (group.rank === 1 && group.size >= 2 && table.tie[group.size] !== undefined)
+      ? table.tie[group.size]
+      : table.placement[group.rank];
+    group.ids.forEach(function(id){ values[id] = value; });
+  });
+  return values;
+}
+
+async function applyProfileDelta(userId, column, delta){
+  var current = await supabaseAdmin.from('profiles').select(column).eq('id', userId).single();
+  if(current.error || !current.data) return null;
+  var newValue = (current.data[column] || 0) + delta;
+  var patch = {};
+  patch[column] = newValue;
+  var updated = await supabaseAdmin.from('profiles').update(patch).eq('id', userId);
+  if(updated.error) return null;
+  return newValue;
+}
+
+// Grava o resultado da partida no perfil. Usa a função SQL apply_match_result
+// (atômica — ver supabase/apply_match_result.sql). Se ela ainda não existir no
+// Supabase ou falhar, cai no método antigo (lê-soma-grava) pra não perder o
+// progresso do jogador. Devolve { skill_rating } ou null.
+async function applyMatchResult(userId, mode, srDelta, coins, won){
+  var res = await supabaseAdmin.rpc('apply_match_result', {
+    p_user_id: userId, p_mode: mode, p_sr_delta: srDelta, p_coins: coins, p_won: won
+  });
+  if(!res.error){
+    var row = Array.isArray(res.data) ? res.data[0] : res.data;
+    if(row) return row;
+  } else {
+    console.error('[perfil] apply_match_result falhou (usando método antigo):', res.error.message);
+  }
+
+  var srColumn = mode === 2 ? 'skill_rating_2p' : 'skill_rating_4p';
+  var newSr = await applyProfileDelta(userId, srColumn, srDelta);
+  if(coins > 0) await applyProfileDelta(userId, 'coins', coins);
+  if(won) await applyProfileDelta(userId, 'wins', 1);
+  await applyProfileDelta(userId, 'matches_played', 1);
+  return newSr === null ? null : { skill_rating: newSr };
+}
+
+async function endRoom(room, winner, cause){
   room.state = 'ended';
+  if(room.tickHandle){ clearInterval(room.tickHandle); room.tickHandle = null; }
+
+  var srDeltas = computeStandingValues(room, SR_TABLE);
+  var coinsEarned = computeStandingValues(room, COINS_TABLE);
+  var rankById = {}, groupSizeById = {};
+  computeStandings(room).forEach(function(group){
+    group.ids.forEach(function(id){ rankById[id] = group.rank; groupSizeById[id] = group.size; });
+  });
+
+  var standings = [];
+  for(var i=0; i<room.entities.length; i++){
+    var ent = room.entities[i];
+    var entry = {
+      id: ent.id, nickname: ent.nickname, isBot: !!ent.isBot,
+      rank: rankById[ent.id],
+      skillRatingDelta: null, skillRatingNew: null,
+      coinsEarned: null
+    };
+    if(ent.userId && srDeltas[ent.id] !== undefined){
+      entry.skillRatingDelta = srDeltas[ent.id];
+      entry.coinsEarned = coinsEarned[ent.id] || 0;
+      // vitória = 1º lugar sem empate (empate no topo não conta como vitória)
+      var won = rankById[ent.id] === 1 && groupSizeById[ent.id] === 1;
+      try {
+        var updated = await applyMatchResult(ent.userId, room.maxPlayers, entry.skillRatingDelta, entry.coinsEarned, won);
+        entry.skillRatingNew = updated ? updated.skill_rating : null;
+      } catch(err){
+        // um erro no perfil de um jogador não pode impedir o "fim de jogo" de todos
+        console.error('[perfil] erro ao gravar resultado de', ent.userId, err);
+      }
+    }
+    standings.push(entry);
+  }
+  standings.sort(function(a,b){ return a.rank - b.rank; });
+
   room.sockets.forEach(function(entity, socketId){
     var result = winner === null ? 'draw' : (entity.id === winner.id ? 'win' : 'lose');
     var sock = io.sockets.sockets.get(socketId);
-    if(sock) sock.emit('gameOver', { result: result, cause: cause });
+    if(sock) sock.emit('gameOver', { result: result, cause: cause, standings: standings });
   });
-  if(room.tickHandle){ clearInterval(room.tickHandle); room.tickHandle = null; }
 }
 
 /* ==================== LOOP DE SIMULAÇÃO ==================== */
@@ -879,7 +1152,8 @@ function broadcastState(room){
         alive:e.alive, deathTimer:e.deathTimer, deathReason:e.deathReason,
         maxBombs:e.maxBombs, fireRange:e.fireRange, speedLevel:e.speedLevel,
         curse:e.curse, isBot:!!e.isBot,
-        bombPass:e.bombPass, shieldActive:e.shieldActive
+        bombPass:e.bombPass, shieldActive:e.shieldActive,
+        nickname:e.nickname, characterId:e.characterId
       };
     }),
     bombs: room.bombs.map(function(b){ return {gx:b.gx, gy:b.gy, timer:b.timer, range:b.range}; }),
@@ -897,6 +1171,7 @@ function clampNum(v, lo, hi){
 
 io.on('connection', function(socket){
   socket.on('createRoom', function(opts, cb){
+    removeFromQueue(socket);
     var maxPlayers = (opts && opts.maxPlayers===2) ? 2 : 4;
     var code = makeRoomCode();
     var room = createRoomObj(code, maxPlayers);
@@ -905,10 +1180,11 @@ io.on('connection', function(socket){
   });
 
   socket.on('joinRoom', function(opts, cb){
+    removeFromQueue(socket);
     var code = ((opts && opts.code) || '').toUpperCase().trim();
     var room = rooms.get(code);
     if(!room){ cb && cb({ok:false, error:'Sala não encontrada.'}); return; }
-    if(room.state !== 'lobby'){ cb && cb({ok:false, error:'Essa sala já começou a partida.'}); return; }
+    if(room.locked || room.state !== 'lobby'){ cb && cb({ok:false, error:'Essa sala já começou a partida.'}); return; }
     if(room.sockets.size >= room.maxPlayers){ cb && cb({ok:false, error:'Sala cheia.'}); return; }
     joinRoomSocket(room, socket, cb, opts && opts.accessToken);
   });
@@ -948,6 +1224,41 @@ io.on('connection', function(socket){
     io.to(room.code).emit('stickerReceived', { from: socket.id, stickerId: stickerId, ts: now });
   });  
 
+  socket.on('findMatch', async function(opts, cb){
+    if(socket.data.roomCode){ cb && cb({ ok:false, error:'Você já está em uma sala.' }); return; }
+    if(socket.data.mmToken){ cb && cb({ ok:false, error:'Você já está na fila.' }); return; }
+    var size = (opts && opts.maxPlayers === 2) ? 2 : 4;
+    var token = ++mmTokenSeq;
+    socket.data.mmToken = token; // reserva já, pra bloquear duplo clique durante o await
+
+    try {
+      var account = await getPlayerAccount(opts && opts.accessToken);
+      if(socket.data.mmToken !== token || !socket.connected) return; // cancelou ou caiu enquanto esperava
+
+      if(account && isUserBusy(account.userId)){
+        socket.data.mmToken = null;
+        cb && cb({ ok:false, error:'Sua conta já está na fila ou em uma partida.' });
+        return;
+      }
+
+      mmQueues[size].push({
+        socket: socket,
+        account: account,               // null = convidado
+        userId: account ? account.userId : null,
+        sr: account && account.skillRating[size] != null ? account.skillRating[size] : 1000,
+        joinedAt: Date.now()
+      });
+      cb && cb({ ok:true });
+      runMatchmaking(); // tenta na hora, sem esperar o próximo tick
+    } catch(err){
+      console.error('[findMatch] erro:', err);
+      if(socket.data.mmToken === token) socket.data.mmToken = null;
+      cb && cb({ ok:false, error:'Não foi possível entrar na fila. Tente de novo.' });
+    }
+  });
+
+  socket.on('cancelFindMatch', function(){ removeFromQueue(socket); });
+
   socket.on('leaveRoom', function(){
     var room = socketRoom(socket);
     if(room) handleLeave(room, socket);
@@ -955,9 +1266,22 @@ io.on('connection', function(socket){
   });
 
   socket.on('disconnect', function(){
+    removeFromQueue(socket);
     var room = socketRoom(socket);
     if(room) handleLeave(room, socket);
   });
+  
+  socket.on('selectCharacter', async function(opts, cb){
+    var account = await getPlayerAccount(opts && opts.accessToken);
+    if(!account){ cb && cb({ok:false, error:'Entre na sua conta pra trocar de personagem.'}); return; }
+    var charId = opts && opts.characterId;
+    if(!playerOwnsCharacter({ownedCharacters: account.ownedCharacters}, charId)){
+      cb && cb({ok:false, error:'Você não possui esse personagem.'}); return;
+    }
+    var updated = await supabaseAdmin.from('profiles').update({selected_character: charId}).eq('id', account.userId);
+    if(updated.error){ cb && cb({ok:false, error:'Não foi possível salvar.'}); return; }
+    cb && cb({ok:true, characterId: charId});
+  });  
 });
 
 httpServer.listen(PORT, function(){
